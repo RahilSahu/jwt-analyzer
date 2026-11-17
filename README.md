@@ -13,16 +13,25 @@ assessments.
 ## What it flags
 
 - alg set to none, or a token with no signature at all
-- Missing exp, an expired token, or an exp more than 10 years out
-- iat in the future
+- A kid (key id) header: if the server uses it to look up the
+  verification key without strict validation, kid is an injection
+  point for path traversal, SQL injection and command injection
+- A missing typ header (optional, but validators use it to tell
+  token types apart)
+- Missing exp, an expired token, or an exp more than 10 years out,
+  with the actual dates printed, not just epoch numbers
+- iat in the future, or an nbf (not-before) that has not been
+  reached yet
 - Missing iss or aud claims
 - Sensitive-looking claims in the payload, such as password, secret,
   ssn or credit_card style key names (the payload is public to anyone
   holding the token)
-- HS256 tokens signed with a notoriously common weak secret. The tool
-  tests a short built-in list ("secret", "password", "changeme" and a
-  few more) against the signature with HMAC, and reports a critical
-  finding if one matches
+- HS256, HS384 and HS512 tokens signed with a commonly used default
+  secret. The tool tests a built-in list of 35 well-known defaults
+  ("secret", "changeme", the jwt.io default "your-256-bit-secret",
+  and similar tutorial and framework placeholders) against the
+  signature with HMAC, and reports a critical finding naming the
+  matched secret if one verifies
 
 ## Usage
 

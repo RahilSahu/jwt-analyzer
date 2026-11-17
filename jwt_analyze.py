@@ -8,14 +8,18 @@ you trust. This tool shows what is inside a token and flags common
 problems:
 
 - alg set to none, or a missing signature
+- a kid header (key ids are a classic injection point when a server
+  uses one to look up a key without strict validation), or a
+  missing typ header
 - missing exp claim, an expired token, or an exp absurdly far ahead
-- iat in the future
+- iat in the future, or an nbf that has not been reached yet
 - missing iss or aud claims
 - sensitive-looking claim names in the payload (password, secret,
   ssn, credit_card and similar)
-- for HS256 tokens, a short list of notoriously common weak secrets
-  is tested against the signature with HMAC. If one matches, that is
-  a critical finding: the token was signed with a guessable secret.
+- for HS256, HS384 and HS512 tokens, a built-in list of commonly
+  used default secrets is tested against the signature with HMAC.
+  If one matches, that is a critical finding: the token was signed
+  with a guessable secret.
 
 Zero dependencies: Python 3.9+ standard library only. Use it on tokens
 from systems you own or are authorised to test.
@@ -30,8 +34,24 @@ import hmac
 import json
 import sys
 import time
+from datetime import datetime, timezone
 
-WEAK_SECRETS = ["secret", "password", "changeme", "secretkey", "jwtsecret", "123456", "key", "default"]
+# Commonly used default HMAC secrets: tutorial examples, framework
+# placeholders and lazy choices that keep showing up in real code.
+# "your-256-bit-secret" is the jwt.io debugger default; several
+# others come straight from popular blog posts and sample projects.
+WEAK_SECRETS = [
+    "secret", "password", "changeme", "secretkey", "secret-key",
+    "secret123", "jwtsecret", "jwt-secret", "jwt_secret",
+    "your-256-bit-secret", "your-secret-key", "your_secret_key",
+    "your-secret", "mysecret", "my-secret", "mysecretkey",
+    "s3cret", "supersecret", "super-secret", "shhhhhhared-secret",
+    "keyboard cat", "123456", "12345678", "123456789", "qwerty",
+    "letmein", "admin", "key", "default", "test", "dev", "jwt",
+    "token", "auth", "private",
+]
+
+HMAC_ALGS = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
 
 SENSITIVE_CLAIM_HINTS = (
     "password", "passwd", "secret", "ssn", "social_security",
@@ -90,12 +110,18 @@ def decode_token(token: str) -> dict:
     }
 
 
+def format_timestamp(value: int | float) -> str:
+    """Render an epoch claim as a human-readable UTC date and time."""
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def try_weak_secrets(decoded: dict) -> str | None:
-    """If this is an HS256 token signed with a known weak secret, return it."""
-    if decoded["header"].get("alg") != "HS256" or not decoded["has_signature"]:
+    """If this is an HMAC token signed with a known weak secret, return it."""
+    digestmod = HMAC_ALGS.get(str(decoded["header"].get("alg")))
+    if digestmod is None or not decoded["has_signature"]:
         return None
     for secret in WEAK_SECRETS:
-        candidate = hmac.new(secret.encode(), decoded["signing_input"], hashlib.sha256).digest()
+        candidate = hmac.new(secret.encode(), decoded["signing_input"], digestmod).digest()
         if hmac.compare_digest(candidate, decoded["signature"]):
             return secret
     return None
@@ -116,6 +142,12 @@ def analyse(decoded: dict, now: int | None = None) -> list[dict]:
     if not decoded["has_signature"]:
         add("critical", "Token has no signature segment. It is not signed at all.")
 
+    kid = header.get("kid")
+    if kid is not None:
+        add("warn", f"Header contains a kid (key id): {kid!r}. If the server uses kid to look up the verification key without strict validation, kid is an injection point: path traversal, SQL injection and command injection have all been delivered through this value.")
+    if "typ" not in header:
+        add("info", "Header has no typ value. typ is optional, but strict validators use it to tell token types apart (for example access tokens from refresh tokens), and a missing typ removes that check.")
+
     exp = payload.get("exp")
     if exp is None:
         add("warn", "No exp claim. The token never expires on its own.")
@@ -123,13 +155,17 @@ def analyse(decoded: dict, now: int | None = None) -> list[dict]:
         add("warn", f"exp claim is not a number: {exp!r}")
     else:
         if exp < now:
-            add("warn", f"Token is expired (exp {int(exp)} is in the past).")
+            add("warn", f"Token is expired: exp {int(exp)} ({format_timestamp(exp)}) is in the past.")
         if exp - now > MAX_REASONABLE_LIFETIME_SECONDS:
-            add("warn", "exp is more than 10 years in the future. Long-lived tokens are a standing credential if leaked.")
+            add("warn", f"exp is more than 10 years in the future ({format_timestamp(exp)}). Long-lived tokens are a standing credential if leaked.")
 
     iat = payload.get("iat")
     if isinstance(iat, (int, float)) and iat > now + 60:
-        add("warn", "iat is in the future. The issuing clock or the token is wrong.")
+        add("warn", f"iat is in the future: iat {int(iat)} ({format_timestamp(iat)}). The issuing clock or the token is wrong.")
+
+    nbf = payload.get("nbf")
+    if isinstance(nbf, (int, float)) and nbf > now:
+        add("warn", f"Token is not valid yet: nbf {int(nbf)} ({format_timestamp(nbf)}) is in the future. A server accepting this token now is ignoring the not-before check.")
 
     if "iss" not in payload:
         add("info", "No iss (issuer) claim.")
@@ -143,7 +179,7 @@ def analyse(decoded: dict, now: int | None = None) -> list[dict]:
 
     weak = try_weak_secrets(decoded)
     if weak is not None:
-        add("critical", f"Signature verifies with the weak secret {weak!r} from the built-in common-secrets list. Anyone can forge tokens for this service.")
+        add("critical", f"Signature verifies with the weak secret {weak!r}, a commonly used default from the built-in list. Anyone can forge tokens for this service.")
     return findings
 
 
